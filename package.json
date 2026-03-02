@@ -1,0 +1,23 @@
+{
+  "name": "e2ee-p2p-chat",
+  "version": "1.0.0",
+  "description": "P2P WebRTC Chat with E2EE",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs --watch",
+    "build": "node esbuild.config.mjs",
+    "start": "node dist/server.js",
+    "deploy": "node esbuild.config.mjs && wrangler deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250224.0",
+    "@types/node": "^22.13.5",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3",
+    "wrangler": "^4.69.0"
+  }
+}
