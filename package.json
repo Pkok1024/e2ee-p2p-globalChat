@@ -1,5 +1,5 @@
 {
-  "name": "e2ee-p2p-chat",
+  "name": "e2ee-p2p-globalChat",
   "version": "1.0.0",
   "description": "P2P WebRTC Chat with E2EE",
   "type": "module",
@@ -10,8 +10,6 @@
     "start": "node dist/server.js",
     "deploy": "node esbuild.config.mjs && wrangler deploy"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250224.0",
