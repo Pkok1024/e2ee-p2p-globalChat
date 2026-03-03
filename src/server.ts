@@ -187,7 +187,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (method === "GET" && pathname === "/history") {
-    const limit = Math.max(1, Math.min(parseInt(parsedUrl.searchParams.get("limit") || "100", 10) || 100, 500));
+    const limit = Math.max(1, Math.min(parseInt(parsedUrl.search_params.get("limit") || "100", 10) || 100, 500));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ full: true, messages: chatService.getHistory(limit) }));
   }
