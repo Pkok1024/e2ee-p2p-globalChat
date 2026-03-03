@@ -256,8 +256,16 @@ const server = http.createServer(async (req, res) => {
     const mimeTypes: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
     const contentType = mimeTypes[path.extname(filePath)] || "application/octet-stream";
     fs.readFile(filePath, (error, content) => {
-      if (error) { res.writeHead(500); res.end(); }
-      else { res.writeHead(200, { "Content-Type": contentType }); res.end(content); }
+      if (error) {
+        res.writeHead(500);
+        res.end("Internal Server Error");
+      } else {
+        res.writeHead(200, { 
+            "Content-Type": contentType,
+            "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' wss:; worker-src 'self' blob:;"
+        });
+        res.end(content, "utf-8");
+      }
     });
   });
 });
