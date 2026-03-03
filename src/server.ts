@@ -4,360 +4,262 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 
+import * as rl from "./lib/rate-limiter.js";
+import { COOKIE_NAME, nodeVerifyCookie, nodeBuildSetCookie, nodeTimingSafeMatch } from "./lib/cookie.js";
+import { renderGate } from "./lib/token-gate.html.js";
+import { ChatService, ChatBroadcaster } from "./lib/chat-service.js";
+import { Signal } from "./lib/types.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Constants
 const PORT = process.env.PORT || 3000;
-const NICKNAME_MAX_LENGTH = 20;
-const MESSAGE_MAX_LENGTH = 2000; // Increased to accommodate encrypted payload
-const MAX_HISTORY_BYTES = 12 * 1024 * 1024; // 12MB in-memory history cap
+const MAX_HISTORY_BYTES = 12 * 1024 * 1024;
+const COMMUNITY_TOKEN = process.env.COMMUNITY_TOKEN;
+const TOKEN_COOKIE_SECRET = process.env.TOKEN_COOKIE_SECRET;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
-// Resolve public directory: check local (bundled) or parent (dev)
+if (!COMMUNITY_TOKEN || !TOKEN_COOKIE_SECRET) {
+  console.error("FATAL: COMMUNITY_TOKEN and TOKEN_COOKIE_SECRET must be set.");
+  process.exit(1);
+}
+
 const PUBLIC_DIR = fs.existsSync(path.join(__dirname, "public"))
   ? path.join(__dirname, "public")
   : path.join(__dirname, "../public");
 
-interface Message {
-  id: string;
-  userId: string;
-  nickname: string;
-  text: string;
-  timestamp: string;
-  isEncrypted?: boolean;
-}
+// Infrastructure Adapter: SSE Broadcaster
+class NodeBroadcaster implements ChatBroadcaster {
+  constructor(private clients: Map<string, http.ServerResponse>) {}
 
-interface User {
-  userId: string;
-  nickname: string;
-  publicKey?: string;
-}
-
-interface AppState {
-  clients_: Map<string, http.ServerResponse>;
-  messages_: Message[];
-  messagesBytes_: number;
-  users_: Map<string, User>;
-}
-
-// Application State
-const state: AppState = {
-  clients_: new Map(),
-  messages_: [],
-  messagesBytes_: 0,
-  users_: new Map(),
-};
-
-const encoder = new TextEncoder();
-
-function messageSizeBytes_(msg: any): number {
-  try {
-    return encoder.encode(JSON.stringify(msg)).length;
-  } catch {
-    return 0;
+  broadcast(data: any, excludeUserId: string | null = null): void {
+    const payload = `data: ${JSON.stringify(data)}\n\n`;
+    for (const [userId, res] of this.clients.entries()) {
+      if (userId !== excludeUserId) {
+        res.write(payload);
+      }
+    }
   }
-}
 
-function pushHistory_(msg: Message): void {
-  const size = messageSizeBytes_(msg);
-  if (size === 0) return;
-  state.messages_.push(msg);
-  state.messagesBytes_ += size;
-  while (state.messagesBytes_ > MAX_HISTORY_BYTES && state.messages_.length > 0) {
-    const removed = state.messages_.shift();
-    if (removed) {
-        state.messagesBytes_ -= messageSizeBytes_(removed);
+  sendTo(userId: string, data: any): void {
+    const res = this.clients.get(userId);
+    if (res) {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
     }
   }
 }
 
-function generateRandomNickname_(): string {
-  const adjectives = ["Swift", "Bright", "Cool", "Mighty", "Zen", "Hyper", "Neo"];
-  const nouns = ["Coder", "User", "Falcon", "Ninja", "Ghost", "Pixel", "Sage"];
-  const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
-  const noun = nouns[Math.floor(Math.random() * nouns.length)];
-  const num = Math.floor(1000 + Math.random() * 9000);
-  return `${adj}${noun}${num}`;
-}
+const clients = new Map<string, http.ServerResponse>();
+const broadcaster = new NodeBroadcaster(clients);
+const chatService = new ChatService(broadcaster, MAX_HISTORY_BYTES);
 
-// Basic in-memory rate limit for /signal
-const RATE_LIMIT_WINDOW_MS = 10_000;
-const RATE_LIMIT_MAX = 200; // Increased limit for signaling
-const rateBuckets = new Map<string, { count: number; start: number }>();
+const SIGNAL_RATE_LIMIT_WINDOW_MS = 10_000;
+const SIGNAL_RATE_LIMIT_MAX = 200;
+const signalRateBuckets = new Map<string, { count: number; start: number }>();
 
-function rateLimitOk_(userId: string): boolean {
+const ADMIN_RESET_RATE_LIMIT_WINDOW_MS = 10_000;
+const ADMIN_RESET_RATE_LIMIT_MAX = 10;
+const adminResetRateBuckets = new Map<string, { count: number; start: number }>();
+
+function signalRateLimitOk(userId: string): boolean {
   const now = Date.now();
-  const bucket = rateBuckets.get(userId) || { count: 0, start: now };
-  if (now - bucket.start > RATE_LIMIT_WINDOW_MS) {
+  const bucket = signalRateBuckets.get(userId) || { count: 0, start: now };
+  if (now - bucket.start > SIGNAL_RATE_LIMIT_WINDOW_MS) {
     bucket.count = 0;
     bucket.start = now;
   }
   bucket.count += 1;
-  rateBuckets.set(userId, bucket);
-  return bucket.count <= RATE_LIMIT_MAX;
+  signalRateBuckets.set(userId, bucket);
+  return bucket.count <= SIGNAL_RATE_LIMIT_MAX;
 }
 
-function parseJsonEnv_(value: string | undefined, fallback: any): any {
+function adminResetRateLimitOk(ip: string): boolean {
+  const now = Date.now();
+  const bucket = adminResetRateBuckets.get(ip) || { count: 0, start: now };
+  if (now - bucket.start > ADMIN_RESET_RATE_LIMIT_WINDOW_MS) {
+    bucket.count = 0;
+    bucket.start = now;
+  }
+  bucket.count += 1;
+  adminResetRateBuckets.set(ip, bucket);
+  return bucket.count <= ADMIN_RESET_RATE_LIMIT_MAX;
+}
+
+function parseJsonEnv(value: string | undefined, fallback: any): any {
   if (!value) return fallback;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed ?? fallback;
-  } catch {
-    return fallback;
-  }
+  try { return JSON.parse(value) ?? fallback; } catch { return fallback; }
 }
 
-function sendToClient_(userId: string, data: any): void {
-  const res = state.clients_.get(userId);
-  if (res) {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  }
+/**
+ * Checks if an IP address is a private or loopback address.
+ */
+function isPrivateIp(ip: string): boolean {
+  return (
+    ip === "127.0.0.1" ||
+    ip === "::1" ||
+    ip === "::ffff:127.0.0.1" ||
+    ip.startsWith("10.") ||
+    ip.startsWith("192.168.") ||
+    (ip.startsWith("172.") &&
+     parseInt(ip.split(".")[1], 10) >= 16 &&
+     parseInt(ip.split(".")[1], 10) <= 31) ||
+    ip.startsWith("fe80:") ||
+    ip.startsWith("fc00:") ||
+    ip.startsWith("fd00:")
+  );
 }
 
-function broadcast_(data: any, excludeUserId: string | null = null): void {
-  const payload = `data: ${JSON.stringify(data)}\n\n`;
-  for (const [userId, res] of state.clients_.entries()) {
-    if (userId !== excludeUserId) {
-      res.write(payload);
-    }
+function clientIp(req: http.IncomingMessage): string {
+  const remoteAddr = req.socket.remoteAddress ?? "unknown";
+  const xff = req.headers["x-forwarded-for"];
+
+  // Smart IP resolution: trust XFF if explicitly configured OR if connection is from a local/private address
+  const trustProxy = process.env.TRUST_PROXY === "true" || isPrivateIp(remoteAddr);
+
+  if (xff && trustProxy) {
+    const first = Array.isArray(xff) ? xff[0] : xff.split(",")[0];
+    return first.trim();
   }
+
+  return remoteAddr;
+}
+
+async function readBody(req: http.IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks).toString();
 }
 
 const server = http.createServer(async (req, res) => {
+  const ip = clientIp(req);
   const parsedUrl = new URL(req.url || "/", `http://${req.headers.host}`);
   const pathname = parsedUrl.pathname;
-  const method = req.method;
+  const method = req.method?.toUpperCase() || "GET";
 
-  // JSON Body Parser for POST
-  let body: any = {};
-  if (method === "POST") {
-    try {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) {
-        chunks.push(chunk);
-      }
-      const data = Buffer.concat(chunks).toString();
-      if (data) {
-        body = JSON.parse(data);
-      }
-    } catch (err) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "Invalid JSON" }));
-    }
+  // --- PUBLIC ROUTES ---
+  if (method === "GET" && pathname === "/gate") {
+    const { allowed, waitMs } = rl.check(ip);
+    const html = renderGate({ waitUntil: allowed ? 0 : Date.now() + waitMs });
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    return res.end(html);
   }
 
-  // Routes
+  if (method === "POST" && pathname === "/verify-token") {
+    const { allowed, waitMs } = rl.check(ip);
+    if (!allowed) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, message: "Too many attempts.", waitUntil: Date.now() + waitMs }));
+    }
+    const start = Date.now();
+    const body = await readBody(req);
+    const params = new URLSearchParams(body);
+    const token = params.get("token")?.trim();
+    const match = await nodeTimingSafeMatch(token || "", COMMUNITY_TOKEN || "");
+    const elapsed = Date.now() - start;
+    if (elapsed < 500) await new Promise(r => setTimeout(r, 500 - elapsed));
+
+    if (!match) {
+      rl.recordFailure(ip);
+      const { waitMs: newWait } = rl.check(ip);
+      res.writeHead(401, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, message: "Invalid token.", waitUntil: newWait > 0 ? Date.now() + newWait : undefined }));
+    }
+
+    rl.recordSuccess(ip);
+    const setCookie = await nodeBuildSetCookie(COMMUNITY_TOKEN!, TOKEN_COOKIE_SECRET!);
+    res.writeHead(200, { "Set-Cookie": setCookie, "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, redirect: "/" }));
+  }
+
+  // --- AUTH CHECK ---
+  const authed = await nodeVerifyCookie(req.headers["cookie"], COMMUNITY_TOKEN!, TOKEN_COOKIE_SECRET!);
+  if (!authed) {
+    res.writeHead(302, { "Location": "/gate", "Cache-Control": "no-store" });
+    return res.end();
+  }
+
+  // --- PROTECTED ROUTES ---
   if (method === "GET" && pathname === "/config") {
-    const turnServers = parseJsonEnv_(process.env.TURN_SERVERS_JSON, []);
-    const signalEndpoints = parseJsonEnv_(process.env.SIGNAL_ENDPOINTS_JSON, ["/signal"]);
-    const signalToken = process.env.SIGNAL_TOKEN || "";
+    const turnServers = parseJsonEnv(process.env.TURN_SERVERS_JSON, []);
+    const signalEndpoints = parseJsonEnv(process.env.SIGNAL_ENDPOINTS_JSON, ["/signal"]);
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ turnServers, signalToken, signalEndpoints }));
+    return res.end(JSON.stringify({ turnServers, signalToken: process.env.SIGNAL_TOKEN || "", signalEndpoints }));
   }
 
   if (method === "GET" && pathname === "/history") {
-    const after = parsedUrl.searchParams.get("after") || "";
-    const before = parsedUrl.searchParams.get("before") || "";
-    const limitParam = parsedUrl.searchParams.get("limit");
-    const limit = Math.max(1, Math.min(parseInt(limitParam || "100", 10) || 100, 500));
-
-    let result: any;
-    if (after) {
-      const idx = state.messages_.findIndex(m => m.id === after);
-      if (idx === -1) result = { full: true, messages: state.messages_.slice(-limit) };
-      else result = { full: false, messages: state.messages_.slice(idx + 1) };
-    } else if (before) {
-      const idx = state.messages_.findIndex(m => m.id === before);
-      if (idx === -1) result = { full: true, messages: state.messages_.slice(-limit) };
-      else {
-        const start = Math.max(0, idx - limit);
-        result = { full: false, messages: state.messages_.slice(start, idx) };
-      }
-    } else {
-      result = { full: true, messages: state.messages_.slice(-limit) };
-    }
+    const limit = Math.max(1, Math.min(parseInt(parsedUrl.searchParams.get("limit") || "100", 10) || 100, 500));
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify(result));
+    return res.end(JSON.stringify({ full: true, messages: chatService.getHistory(limit) }));
   }
 
   if (method === "GET" && pathname === "/events") {
     const userId = `user_${crypto.randomUUID().replace(/-/g, "").substring(0, 12)}`;
-    const nickname = generateRandomNickname_();
-
-    console.log(`INFO: SSE Connected: ${userId} (${nickname})`);
-
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no"
-    });
-
-    // Send initial comment to confirm stream
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
     res.write(":ok\n\n");
-
-    state.clients_.set(userId, res);
-    state.users_.set(userId, { userId, nickname });
-
-    res.write(`data: ${JSON.stringify({
-      type: "SYSTEM_INIT",
-      payload: {
-        userId,
-        nickname,
-        history: state.messages_,
-        users: Array.from(state.users_.values()).filter(u => u.userId !== userId)
-      }
-    })}\n\n`);
-
-    broadcast_({
-      type: "USER_JOINED",
-      payload: { userId, nickname }
-    }, userId);
-
-    broadcast_({ type: "SYSTEM_ONLINE_COUNT", count: state.clients_.size });
-
-    const pingInterval = setInterval(() => {
-        res.write(":ping\n\n");
-    }, 30000);
-
+    const user = chatService.addUser(userId);
+    clients.set(userId, res);
+    res.write(`data: ${JSON.stringify({ type: "SYSTEM_INIT", payload: { userId, nickname: user.nickname, history: chatService.getHistory(), users: chatService.getAllUsers().filter(u => u.userId !== userId) } })}\n\n`);
+    chatService.broadcastPresence("USER_JOINED", { userId, nickname: user.nickname }, userId);
+    chatService.broadcastPresence("SYSTEM_ONLINE_COUNT", chatService.onlineCount);
+    const pingInterval = setInterval(() => res.write(":ping\n\n"), 30000);
     req.on("close", () => {
-      console.log(`INFO: SSE Disconnected: ${userId}`);
       clearInterval(pingInterval);
-      state.clients_.delete(userId);
-      state.users_.delete(userId);
-
-      broadcast_({
-        type: "USER_LEFT",
-        payload: { userId }
-      });
-      broadcast_({ type: "SYSTEM_ONLINE_COUNT", count: state.clients_.size });
+      clients.delete(userId);
+      chatService.removeUser(userId);
+      chatService.broadcastPresence("USER_LEFT", { userId });
+      chatService.broadcastPresence("SYSTEM_ONLINE_COUNT", chatService.onlineCount);
     });
     return;
   }
 
   if (method === "POST" && pathname === "/signal") {
-    const { type, payload, from } = body;
-    const token = req.headers["x-signal-token"] || "";
-
-    if (process.env.SIGNAL_TOKEN && token !== process.env.SIGNAL_TOKEN) {
-      console.error(`ERROR: Unauthorized signal from ${from}`);
-      res.writeHead(401, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "Unauthorized" }));
+    const bodyText = await readBody(req);
+    let signal: Signal;
+    try { signal = JSON.parse(bodyText); } catch {
+      res.writeHead(400); return res.end(JSON.stringify({ error: "Invalid JSON" }));
     }
 
-    if (!from || !state.clients_.has(from)) {
-      console.warn(`WARN: Signal from unknown/expired session: ${from}`);
-      res.writeHead(401, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "Invalid session" }));
-    }
-
-    if (!rateLimitOk_(from)) {
-      res.writeHead(429, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "Rate limit" }));
-    }
-
-    const user = state.users_.get(from);
-    if (!user) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "User not found" }));
-    }
-
-    if (typeof type === "string") {
-      switch (type) {
-        case "CHAT_MESSAGE":
-          const text = payload?.text?.trim();
-          if (text && text.length <= MESSAGE_MAX_LENGTH) {
-            const messageData: Message = {
-              id: payload.id || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`,
-              userId: from,
-              nickname: user.nickname,
-              text,
-              timestamp: payload.timestamp || new Date().toISOString(),
-              isEncrypted: !!payload.isEncrypted
-            };
-            pushHistory_(messageData);
-            broadcast_({ type: "CHAT_MESSAGE", payload: messageData }, from);
-          }
-          break;
-
-        case "UPDATE_NICKNAME":
-          const { publicKey } = payload;
-          if (publicKey) user.publicKey = publicKey;
-          const newNickname = payload?.nickname?.trim();
-          if (newNickname && newNickname.length <= NICKNAME_MAX_LENGTH) {
-            const oldNickname = user.nickname;
-            user.nickname = newNickname;
-            broadcast_({
-              type: "SYSTEM_NOTIFICATION",
-              payload: { text: `${oldNickname} changed their nickname to ${newNickname}` }
-            });
-            broadcast_({
-              type: "USER_UPDATED",
-              payload: { userId: from, nickname: newNickname, publicKey: user.publicKey }
-            });
-          }
-          break;
-
-        case "SIGNAL":
-          const { to, signal } = payload;
-          if (to && signal) {
-            sendToClient_(to, {
-              type: "SIGNAL",
-              payload: { from, signal }
-            });
-          }
-          break;
-
-        case "ADMIN_RESET":
-          if (payload?.token === process.env.ADMIN_TOKEN) {
-            console.log("INFO: Admin history reset");
-            state.messages_ = [];
-            state.messagesBytes_ = 0;
-            broadcast_({ type: "SYSTEM_NOTIFICATION", payload: { text: "Chat history cleared" } });
-            broadcast_({ type: "CHAT_CLEARED" });
-          }
-          break;
+    if (signal.type === "ADMIN_RESET") {
+      if (!adminResetRateLimitOk(ip)) {
+        res.writeHead(429); return res.end(JSON.stringify({ error: "Rate limit" }));
       }
+      const match = await nodeTimingSafeMatch(signal.payload?.token || "", ADMIN_TOKEN || "");
+      if (chatService.adminReset(match)) {
+        res.writeHead(200); return res.end(JSON.stringify({ success: true }));
+      }
+      res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" }));
     }
 
-    res.writeHead(200, { "Content-Type": "application/json" });
+    const from = signal.from;
+    if (!from || !clients.has(from)) {
+      res.writeHead(401); return res.end(JSON.stringify({ error: "Invalid session" }));
+    }
+
+    if (!signalRateLimitOk(from)) {
+      res.writeHead(429); return res.end(JSON.stringify({ error: "Rate limit" }));
+    }
+
+    const result = chatService.handleSignal(from, signal);
+    if (!result.success) {
+      res.writeHead(result.error === "User not found" ? 404 : 400);
+      return res.end(JSON.stringify({ error: result.error }));
+    }
+    res.writeHead(200);
     return res.end(JSON.stringify({ success: true }));
   }
 
-  // Static File Server
+  // --- STATIC FILES ---
   let filePath = path.join(PUBLIC_DIR, pathname === "/" ? "index.html" : pathname);
-
-  if (!filePath.startsWith(PUBLIC_DIR)) {
-    res.writeHead(403);
-    return res.end("Forbidden");
-  }
-
+  if (!filePath.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end("Forbidden"); }
   fs.stat(filePath, (err, stats) => {
-    if (err || !stats.isFile()) {
-        filePath = path.join(PUBLIC_DIR, "index.html");
-    }
-
-    const ext = path.extname(filePath).toLowerCase();
-    const mimeTypes: Record<string, string> = {
-      ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json",
-      ".png": "image/png", ".jpg": "image/jpg", ".gif": "image/gif", ".svg": "image/svg+xml",
-      ".wav": "audio/wav", ".mp4": "video/mp4", ".woff": "application/font-woff", ".ttf": "application/font-ttf",
-      ".wasm": "application/wasm",
-    };
-
-    const contentType = mimeTypes[ext] || "application/octet-stream";
+    if (err || !stats.isFile()) filePath = path.join(PUBLIC_DIR, "index.html");
+    const mimeTypes: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
+    const contentType = mimeTypes[path.extname(filePath)] || "application/octet-stream";
     fs.readFile(filePath, (error, content) => {
-      if (error) {
-        res.writeHead(500);
-        res.end("Internal Server Error");
-      } else {
-        res.writeHead(200, { "Content-Type": contentType });
-        res.end(content, "utf-8");
-      }
+      if (error) { res.writeHead(500); res.end(); }
+      else { res.writeHead(200, { "Content-Type": contentType }); res.end(content); }
     });
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`INFO: Server listening on port ${PORT}`);
-});
+server.listen(PORT, () => { console.log(`INFO: Server listening on port ${PORT}`); });
