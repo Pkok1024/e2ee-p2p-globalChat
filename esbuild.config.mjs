@@ -11,6 +11,7 @@ const commonConfig = {
   legalComments: 'none',
   define: { 'process.env.NODE_ENV': isDev ? '"development"' : '"production"' },
   drop: isDev ? [] : ['console', 'debugger'],
+  external: ['node:crypto', 'node:http', 'node:fs', 'node:path', 'node:url'],
 };
 
 // 1. Server Build (Node.js)
@@ -21,7 +22,6 @@ const serverConfig = {
   platform: 'node',
   format: 'esm',
   target: 'node18',
-  packages: 'external', // keep node built-ins external
 };
 
 // 2. Worker Build (Cloudflare Workers / Neutral)

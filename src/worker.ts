@@ -1,86 +1,60 @@
-/**
- * Enterprise P2P Signaling Worker (SSE) - Durable Object Implementation
- */
+import * as rl from "./lib/rate-limiter.js";
+import { workerVerifyCookie, workerBuildSetCookie, workerTimingSafeMatch } from "./lib/cookie.js";
+import { renderGate } from "./lib/token-gate.html.js";
+import { ChatService, ChatBroadcaster } from "./lib/chat-service.js";
+import { Signal } from "./lib/types.js";
 
-interface Message {
-  id: string;
-  userId: string;
-  nickname: string;
-  text: string;
-  timestamp: string;
-  isEncrypted?: boolean;
-}
+class WorkerBroadcaster implements ChatBroadcaster {
+  constructor(private sessions: Map<string, ReadableStreamDefaultController>) {}
 
-interface User {
-  userId: string;
-  nickname: string;
-  publicKey?: string;
+  broadcast(data: any, excludeUserId: string | null = null): void {
+    const payload = new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`);
+    for (const [userId, controller] of this.sessions.entries()) {
+      if (userId !== excludeUserId) {
+        try { controller.enqueue(payload); } catch { this.sessions.delete(userId); }
+      }
+    }
+  }
+
+  sendTo(userId: string, data: any): void {
+    const controller = this.sessions.get(userId);
+    if (controller) {
+      try {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`));
+      } catch { this.sessions.delete(userId); }
+    }
+  }
 }
 
 export class ChatRoom {
-  state_: DurableObjectState;
-  env_: any;
-  sessions_: Map<string, ReadableStreamDefaultController>;
-  users_: Map<string, User>;
-  history_: Message[];
-  historyBytes_: number;
-  MAX_HISTORY_BYTES_: number;
-  encoder_: TextEncoder;
-  rateBuckets_: Map<string, { count: number; start: number }>;
-  RATE_LIMIT_WINDOW_MS_: number;
-  RATE_LIMIT_MAX_: number;
+  private service: ChatService;
+  private sessions = new Map<string, ReadableStreamDefaultController>();
+  private rateBuckets = new Map<string, { count: number; start: number }>;
+  private readonly RATE_LIMIT_WINDOW_MS = 10_000;
+  private readonly RATE_LIMIT_MAX = 200;
 
-  constructor(state: DurableObjectState, env: any) {
-    this.state_ = state;
-    this.env_ = env;
-    this.sessions_ = new Map();
-    this.users_ = new Map();
-    this.history_ = [];
-    this.historyBytes_ = 0;
-    this.MAX_HISTORY_BYTES_ = 12 * 1024 * 1024;
-    this.encoder_ = new TextEncoder();
-    this.rateBuckets_ = new Map();
-    this.RATE_LIMIT_WINDOW_MS_ = 10_000;
-    this.RATE_LIMIT_MAX_ = 200;
+  constructor(private state: DurableObjectState, private env: any) {
+    const broadcaster = new WorkerBroadcaster(this.sessions);
+    this.service = new ChatService(broadcaster, 12 * 1024 * 1024);
 
-    this.state_.blockConcurrencyWhile(async () => {
-      const stored = await this.state_.storage.get<Message[]>("history");
-      this.history_ = stored || [];
+    this.state.blockConcurrencyWhile(async () => {
+      const stored = await this.state.storage.get<any[]>("history");
+      if (stored) {
+        stored.forEach(m => (this.service as any).history_.push(m));
+      }
     });
   }
 
-  rateLimitOk_(userId: string): boolean {
+  private rateLimitOk(userId: string): boolean {
     const now = Date.now();
-    const bucket = this.rateBuckets_.get(userId) || { count: 0, start: now };
-    if (now - bucket.start > this.RATE_LIMIT_WINDOW_MS_) {
+    const bucket = this.rateBuckets.get(userId) || { count: 0, start: now };
+    if (now - bucket.start > this.RATE_LIMIT_WINDOW_MS) {
       bucket.count = 0;
       bucket.start = now;
     }
     bucket.count += 1;
-    this.rateBuckets_.set(userId, bucket);
-    return bucket.count <= this.RATE_LIMIT_MAX_;
-  }
-
-  messageSizeBytes_(msg: any): number {
-    try {
-      return this.encoder_.encode(JSON.stringify(msg)).length;
-    } catch {
-      return 0;
-    }
-  }
-
-  pushHistory_(msg: Message): void {
-    const size = this.messageSizeBytes_(msg);
-    if (size === 0) return;
-    this.history_.push(msg);
-    this.historyBytes_ += size;
-    while (this.historyBytes_ > this.MAX_HISTORY_BYTES_ && this.history_.length > 0) {
-      const removed = this.history_.shift();
-      if (removed) {
-        this.historyBytes_ -= this.messageSizeBytes_(removed);
-      }
-    }
-    this.state_.storage.put("history", this.history_);
+    this.rateBuckets.set(userId, bucket);
+    return bucket.count <= this.RATE_LIMIT_MAX;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -88,159 +62,125 @@ export class ChatRoom {
 
     if (url.pathname === "/events") {
       const userId = `user_${crypto.randomUUID().split('-')[0]}`;
-      const nickname = this.generateRandomNickname_();
-
+      const user = this.service.addUser(userId);
       let pingTimer: any;
 
       const stream = new ReadableStream({
         start: (controller) => {
-          this.sessions_.set(userId, controller);
-          this.users_.set(userId, { userId, nickname });
-
-          // Immediate flush with :ok to bypass buffering
-          controller.enqueue(this.encoder_.encode(":ok\n\n"));
-
+          this.sessions.set(userId, controller);
+          controller.enqueue(new TextEncoder().encode(":ok\n\n"));
           const initData = {
             type: "SYSTEM_INIT",
             payload: {
               userId,
-              nickname,
-              history: this.history_,
-              users: Array.from(this.users_.values()).filter(u => u.userId !== userId)
+              nickname: user.nickname,
+              history: this.service.getHistory(100),
+              users: this.service.getAllUsers().filter(u => u.userId !== userId)
             }
           };
-          controller.enqueue(this.encoder_.encode(`data: ${JSON.stringify(initData)}\n\n`));
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(initData)}\n\n`));
 
-          this.broadcast_({
-            type: "USER_JOINED",
-            payload: { userId, nickname }
-          }, userId);
-
-          this.broadcast_({ type: "SYSTEM_ONLINE_COUNT", count: this.sessions_.size });
+          this.service.broadcastPresence("USER_JOINED", { userId, nickname: user.nickname }, userId);
+          this.service.broadcastPresence("SYSTEM_ONLINE_COUNT", this.service.onlineCount);
 
           pingTimer = setInterval(() => {
-            try {
-              controller.enqueue(this.encoder_.encode(":ping\n\n"));
-            } catch (e) {
-              clearInterval(pingTimer);
-            }
-          }, 15000); // Shorter ping
+            try { controller.enqueue(new TextEncoder().encode(":ping\n\n")); } catch { clearInterval(pingTimer); }
+          }, 15000);
         },
         cancel: () => {
           clearInterval(pingTimer);
-          this.sessions_.delete(userId);
-          this.users_.delete(userId);
-          this.broadcast_({ type: "USER_LEFT", payload: { userId } });
-          this.broadcast_({ type: "SYSTEM_ONLINE_COUNT", count: this.sessions_.size });
+          this.sessions.delete(userId);
+          this.service.removeUser(userId);
+          this.service.broadcastPresence("USER_LEFT", { userId });
+          this.service.broadcastPresence("SYSTEM_ONLINE_COUNT", this.service.onlineCount);
         }
       });
 
       return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache, no-transform",
-          "Connection": "keep-alive",
-          "X-Accel-Buffering": "no",
-          "X-Content-Type-Options": "nosniff"
-        },
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff" },
       });
     }
 
     if (url.pathname === "/history") {
-      const result = { full: true, messages: this.history_.slice(-100) };
-      return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ full: true, messages: this.service.getHistory(100) }), {
+        headers: { "Content-Type": "application/json" }
+      });
     }
 
     if (url.pathname === "/signal" && request.method === "POST") {
-      const body: any = await request.json();
-      const { type, payload, from } = body;
-
-      if (!from || !this.sessions_.has(from)) return new Response("Invalid session", { status: 401 });
-      if (!this.rateLimitOk_(from)) return new Response("Rate limit", { status: 429 });
-
-      const user = this.users_.get(from);
-      if (!user) return new Response("User not found", { status: 404 });
-
-      switch (type) {
-        case "CHAT_MESSAGE":
-          const text = payload?.text?.trim();
-          if (text) {
-            const msg: Message = {
-              id: payload.id || crypto.randomUUID(),
-              userId: from,
-              nickname: user.nickname,
-              text,
-              timestamp: payload.timestamp || new Date().toISOString(),
-              isEncrypted: !!payload.isEncrypted
-            };
-            this.pushHistory_(msg);
-            this.broadcast_({ type: "CHAT_MESSAGE", payload: msg }, from);
-          }
-          break;
-
-        case "UPDATE_NICKNAME":
-          const newNick = payload?.nickname?.trim();
-          const { publicKey } = payload;
-          if (newNick && newNick.length <= 20) {
-            user.nickname = newNick;
-            if (publicKey) user.publicKey = publicKey;
-            this.broadcast_({
-                type: "USER_UPDATED",
-                payload: { userId: from, nickname: newNick, publicKey: user.publicKey }
-            });
-          }
-          break;
-
-        case "SIGNAL":
-          const { to, signal } = payload;
-          const controller = this.sessions_.get(to);
-          if (controller) {
-            controller.enqueue(this.encoder_.encode(`data: ${JSON.stringify({ type: "SIGNAL", payload: { from, signal } })}\n\n`));
-          }
-          break;
+      const signal: Signal = await request.json();
+      if (signal.type === "ADMIN_RESET") {
+        const match = await workerTimingSafeMatch(signal.payload?.token || "", this.env.ADMIN_TOKEN || "");
+        if (this.service.adminReset(match)) {
+          this.state.storage.delete("history");
+          return new Response(JSON.stringify({ success: true }));
+        }
+        return new Response("Unauthorized", { status: 401 });
       }
-      return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+
+      if (!signal.from || !this.sessions.has(signal.from)) return new Response("Invalid session", { status: 401 });
+      if (!this.rateLimitOk(signal.from)) return new Response("Rate limit", { status: 429 });
+
+      const result = this.service.handleSignal(signal.from, signal);
+      if (!result.success) return new Response(result.error, { status: 400 });
+
+      this.state.storage.put("history", this.service.getHistory(500));
+      return new Response(JSON.stringify({ success: true }));
     }
 
     return new Response("Not Found", { status: 404 });
-  }
-
-  broadcast_(data: any, excludeUserId: string | null = null): void {
-    const msg = this.encoder_.encode(`data: ${JSON.stringify(data)}\n\n`);
-    for (const [userId, controller] of this.sessions_.entries()) {
-      if (userId !== excludeUserId) {
-        try {
-          controller.enqueue(msg);
-        } catch (e) {
-          this.sessions_.delete(userId);
-        }
-      }
-    }
-  }
-
-  generateRandomNickname_(): string {
-    const adjectives = ["Swift", "Bright", "Cool", "Mighty", "Zen", "Hyper", "Neo"];
-    const nouns = ["Coder", "User", "Falcon", "Ninja", "Ghost", "Pixel", "Sage"];
-    const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
-    const noun = nouns[Math.floor(Math.random() * nouns.length)];
-    const num = Math.floor(1000 + Math.random() * 9000);
-    return `${adj}${noun}${num}`;
   }
 }
 
 export default {
   async fetch(request: Request, env: any) {
     const url = new URL(request.url);
+    const method = request.method.toUpperCase();
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+
+    if (method === "GET" && url.pathname === "/gate") {
+      const { allowed, waitMs } = rl.check(ip);
+      return new Response(renderGate({ waitUntil: allowed ? 0 : Date.now() + waitMs }), {
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      });
+    }
+
+    if (method === "POST" && url.pathname === "/verify-token") {
+      const { allowed, waitMs } = rl.check(ip);
+      if (!allowed) return new Response(JSON.stringify({ ok: false, waitMs }), { status: 429 });
+
+      const body = await request.text();
+      const params = new URLSearchParams(body);
+      const token = params.get("token")?.trim();
+
+      const match = await workerTimingSafeMatch(token || "", env.COMMUNITY_TOKEN || "");
+      if (match) {
+        rl.recordSuccess(ip);
+        const setCookie = await workerBuildSetCookie(env.COMMUNITY_TOKEN, env.TOKEN_COOKIE_SECRET);
+        return new Response(JSON.stringify({ ok: true, redirect: "/" }), {
+          headers: { "Set-Cookie": setCookie, "Content-Type": "application/json" },
+        });
+      }
+      rl.recordFailure(ip);
+      return new Response(JSON.stringify({ ok: false }), { status: 401 });
+    }
+
+    const cookieHeader = request.headers.get("Cookie") || "";
+    if (!(await workerVerifyCookie(cookieHeader, env.COMMUNITY_TOKEN, env.TOKEN_COOKIE_SECRET))) {
+      return Response.redirect(new URL("/gate", request.url).toString(), 302);
+    }
+
     if (url.pathname === "/config") {
       return new Response(JSON.stringify({ turnServers: [], signalToken: "", signalEndpoints: ["/signal"] }), {
         headers: { "Content-Type": "application/json" }
       });
     }
-    if (url.pathname === "/events" || url.pathname === "/signal" || url.pathname === "/history") {
+
+    if (["/events", "/signal", "/history"].includes(url.pathname)) {
       const id = env.CHAT_ROOM.idFromName("global-chat");
-      const stub = env.CHAT_ROOM.get(id);
-      return stub.fetch(request);
+      return env.CHAT_ROOM.get(id).fetch(request);
     }
+
     return env.ASSETS ? await env.ASSETS.fetch(request) : new Response("Not Found", { status: 404 });
   }
 };
