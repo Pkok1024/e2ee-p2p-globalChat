@@ -179,7 +179,7 @@ class MeshController {
         es.onmessage = (e) => this.handleSystemEvent(JSON.parse(e.data));
     }
 
-    private async handleSystemEvent(data: any) {
+    private async handleSystemEvent(data: unknown) {
         const { type, payload } = data;
         switch (type) {
             case "SYSTEM_INIT":
@@ -187,7 +187,7 @@ class MeshController {
                 this.currentUser.nick = payload.nickname;
                 (document.getElementById("nicknameInput") as HTMLInputElement).value = this.currentUser.nick;
                 this.allUsers = [{ userId: this.currentUser.id, nickname: this.currentUser.nick, publicKey: ab2b64(await crypto.subtle.exportKey("spki", this.keyPair.publicKey)) }, ...payload.users];
-                this.postSignal("UPDATE_NICKNAME", { nickname: this.currentUser.nick, publicKey: ab2b64(await crypto.subtle.exportKey("spki", this.keyPair.publicKey)) });
+                void this.postSignal("UPDATE_NICKNAME", { nickname: this.currentUser.nick, publicKey: ab2b64(await crypto.subtle.exportKey("spki", this.keyPair.publicKey)) });
                 if (payload.history) await this.renderHistory(payload.history);
                 this.refreshTopology();
                 break;
@@ -199,7 +199,7 @@ class MeshController {
                     u.nickname = payload.nickname;
                     if (payload.publicKey) {
                         u.publicKey = payload.publicKey;
-                        this.shareKeyWithPeer(u.userId);
+                        void this.shareKeyWithPeer(u.userId);
                     }
                 }
                 this.refreshTopology(); break;
@@ -209,9 +209,9 @@ class MeshController {
                 this.peers.delete(payload.userId);
                 this.refreshTopology(); break;
             case "CHAT_MESSAGE":
-                this.handleIncomingMessage(payload); break;
+                void this.handleIncomingMessage(payload); break;
             case "SIGNAL":
-                this.handleRTCSignal(payload); break;
+                void this.handleRTCSignal(payload); break;
             case "SYSTEM_ONLINE_COUNT":
                 this.ui.updateOnlineCount(data.payload ?? data.count); break;
             case "CHAT_CLEARED":
@@ -219,14 +219,14 @@ class MeshController {
         }
     }
 
-    private async handleIncomingMessage(msg: any) {
+    private async handleIncomingMessage(msg: unknown) {
         if (this.deduplicator.isDuplicate(msg.id)) return;
         const dec = await this.decryptPayload(msg.text);
         if (dec) this.ui.renderMessage(msg.nickname, dec, msg.userId === this.currentUser.id);
         else this.ui.renderPlaceholder(msg.nickname);
     }
 
-    private async handleRTCSignal(payload: any) {
+    private async handleRTCSignal(payload: unknown) {
         const { from, signal } = payload;
         if (signal.sdp) {
             let peer = this.peers.get(from);
@@ -234,7 +234,7 @@ class MeshController {
             await peer.pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
             if (signal.sdp.type === 'offer') {
                 const ans = await peer.pc.createAnswer(); await peer.pc.setLocalDescription(ans);
-                this.postSignal("SIGNAL", { to: from, signal: { sdp: peer.pc.localDescription } });
+                void this.postSignal("SIGNAL", { to: from, signal: { sdp: peer.pc.localDescription } });
             }
         } else if (signal.candidate) {
             this.peers.get(from)?.pc.addIceCandidate(new RTCIceCandidate(signal.candidate)).catch(()=>{});
@@ -254,14 +254,14 @@ class MeshController {
     private async startConnection(peerId: string, initiator: boolean) {
         if (this.peers.has(peerId)) return;
         const pc = new RTCPeerConnection({ iceServers: this.config.turnServers });
-        const pObj = { pc, dc: null as any };
+        const pObj = { pc, dc: null as unknown };
         this.peers.set(peerId, pObj);
 
-        pc.onicecandidate = (e) => { if (e.candidate) this.postSignal("SIGNAL", { to: peerId, signal: { candidate: e.candidate } }); };
+        pc.onicecandidate = (e) => { if (e.candidate) void this.postSignal("SIGNAL", { to: peerId, signal: { candidate: e.candidate } }); };
 
         const setupDC = (dc: RTCDataChannel) => {
             pObj.dc = dc;
-            dc.onopen = () => { this.ui.updateStats(this.getOpenPeerCount()); this.shareKeyWithPeer(peerId); };
+            dc.onopen = () => { this.ui.updateStats(this.getOpenPeerCount()); void this.shareKeyWithPeer(peerId); };
             dc.onclose = () => { this.peers.delete(peerId); this.ui.updateStats(this.getOpenPeerCount()); };
             dc.onmessage = async (e) => {
                 const msg = JSON.parse(e.data);
@@ -284,16 +284,16 @@ class MeshController {
         if (initiator) {
             setupDC(pc.createDataChannel("chat", { ordered: true }));
             const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-            this.postSignal("SIGNAL", { to: peerId, signal: { sdp: pc.localDescription } });
+            void this.postSignal("SIGNAL", { to: peerId, signal: { sdp: pc.localDescription } });
         } else {
-            pc.ondatachannel = (e) => setupDC(e.channel);
+            pc.ondatachannel = (e) => { setupDC(e.channel); };
         }
     }
 
     private refreshTopology() {
         this.allUsers.forEach(u => {
             if (u.userId !== this.currentUser.id && !this.peers.has(u.userId)) {
-                if (this.currentUser.id < u.userId) this.startConnection(u.userId, true);
+                if (this.currentUser.id < u.userId) void this.startConnection(u.userId, true);
             }
         });
         this.ui.updateStats(this.getOpenPeerCount());
@@ -310,7 +310,7 @@ class MeshController {
             const raw = await crypto.subtle.exportKey("raw", this.groupKey);
             const pub = await crypto.subtle.importKey("spki", b642ab(user.publicKey), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
             const enc = await crypto.subtle.encrypt({ name: "RSA-OAEP" }, pub, raw);
-            this.postSignal("SIGNAL", { to: userId, signal: { groupKey: ab2b64(enc) } });
+            void this.postSignal("SIGNAL", { to: userId, signal: { groupKey: ab2b64(enc) } });
         } catch(e) {}
     }
 
@@ -335,13 +335,13 @@ class MeshController {
             const target = this.peers.get(pid);
             if (target?.dc?.readyState === "open") target.dc.send(JSON.stringify(gossipMsg));
         });
-        this.postSignal("CHAT_MESSAGE", { id, text: encrypted, isEncrypted: true });
+        void this.postSignal("CHAT_MESSAGE", { id, text: encrypted, isEncrypted: true });
     }
 
     async updateNickname(nick: string) {
         if (nick && nick.length <= 20) {
             this.currentUser.nick = nick;
-            this.postSignal("UPDATE_NICKNAME", { nickname: nick, publicKey: ab2b64(await crypto.subtle.exportKey("spki", this.keyPair.publicKey)) });
+            void this.postSignal("UPDATE_NICKNAME", { nickname: nick, publicKey: ab2b64(await crypto.subtle.exportKey("spki", this.keyPair.publicKey)) });
         }
     }
 
@@ -373,7 +373,7 @@ class MeshController {
         }
     }
 
-    private async postSignal(type: string, payload: any) {
+    private async postSignal(type: string, payload: unknown) {
         const endpoint = this.config.signalEndpoints[Math.floor(Math.random() * this.config.signalEndpoints.length)];
         try {
             await fetch(endpoint, {
@@ -390,15 +390,15 @@ class MeshController {
 const ui = new UIManager();
 const mesh = new MeshController(ui);
 
-mesh.init();
+void mesh.init();
 
 (document.getElementById("chatForm") as HTMLFormElement).onsubmit = (e) => {
     e.preventDefault();
     const input = document.getElementById("messageInput") as HTMLInputElement;
-    mesh.sendMessage(input.value.trim());
+    void mesh.sendMessage(input.value.trim());
     input.value = "";
 };
 
-document.getElementById("nicknameInput")!.onchange = (e) => {
-    mesh.updateNickname((e.target as HTMLInputElement).value.trim());
+document.getElementById("nicknameInput")?.onchange = (e) => {
+    void mesh.updateNickname((e.target as HTMLInputElement).value.trim());
 };

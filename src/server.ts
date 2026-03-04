@@ -32,7 +32,7 @@ const PUBLIC_DIR = fs.existsSync(path.join(__dirname, "public"))
 class NodeBroadcaster implements ChatBroadcaster {
   constructor(private clients: Map<string, http.ServerResponse>) {}
 
-  broadcast(data: any, excludeUserId: string | null = null): void {
+  broadcast(data: unknown, excludeUserId: string | null = null): void {
     const payload = `data: ${JSON.stringify(data)}\n\n`;
     for (const [userId, res] of this.clients.entries()) {
       if (userId !== excludeUserId) {
@@ -41,7 +41,7 @@ class NodeBroadcaster implements ChatBroadcaster {
     }
   }
 
-  sendTo(userId: string, data: any): void {
+  sendTo(userId: string, data: unknown): void {
     const res = this.clients.get(userId);
     if (res) {
       res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -85,7 +85,7 @@ function adminResetRateLimitOk(ip: string): boolean {
   return bucket.count <= ADMIN_RESET_RATE_LIMIT_MAX;
 }
 
-function parseJsonEnv(value: string | undefined, fallback: any): any {
+function parseJsonEnv(value: string | undefined, fallback: unknown): any {
   if (!value) return fallback;
   try { return JSON.parse(value) ?? fallback; } catch { return fallback; }
 }

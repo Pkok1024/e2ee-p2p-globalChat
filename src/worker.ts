@@ -25,13 +25,13 @@ interface Message {
 interface User {
     userId: string;
     nickname: string;
-    publicKey?: any;
+    publicKey?: unknown;
 }
 
 // Refactored ChatRoom class
 export class ChatRoom {
   state: DurableObjectState;
-  env: any;
+  env: unknown;
   sessions: Map<string, ReadableStreamDefaultController>;
   users: Map<string, User>;
   history: Message[];
@@ -39,7 +39,7 @@ export class ChatRoom {
   encoder: TextEncoder;
   rateBuckets: Map<string, { count: number; start: number }>;
 
-  constructor(state: DurableObjectState, env: any) {
+  constructor(state: DurableObjectState, env: unknown) {
     this.state = state;
     this.env = env;
     this.sessions = new Map();
@@ -70,7 +70,7 @@ export class ChatRoom {
   }
   
   // More robust message size calculation
-  messageSizeBytes(msg: any): number {
+  messageSizeBytes(msg: unknown): number {
     try {
       return this.encoder.encode(JSON.stringify(msg)).length;
     } catch {
@@ -125,7 +125,7 @@ export class ChatRoom {
     const userId = `user_${crypto.randomUUID().split('-')[0]}`;
     const nickname = this.generateRandomNickname();
 
-    let pingTimer: any;
+    let pingTimer: unknown;
 
     const stream = new ReadableStream({
       start: (controller) => {
@@ -186,7 +186,7 @@ export class ChatRoom {
 
   // Signal handler with improved validation
   async handleSignal(request: Request): Promise<Response> {
-    let body: any;
+    let body: unknown;
     try {
         body = await request.json();
     } catch (e) {
@@ -253,12 +253,12 @@ export class ChatRoom {
   }
   
   // Utility to send a server-sent event
-  sendEvent(controller: ReadableStreamDefaultController, data: any) {
+  sendEvent(controller: ReadableStreamDefaultController, data: unknown) {
       controller.enqueue(this.encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
   }
 
   // Broadcast to all clients
-  broadcast(data: any, excludeUserId: string | null = null): void {
+  broadcast(data: unknown, excludeUserId: string | null = null): void {
     const msg = this.encoder.encode(`data: ${JSON.stringify(data)}\n\n`);
     for (const [userId, controller] of this.sessions.entries()) {
       if (userId !== excludeUserId) {
@@ -282,7 +282,7 @@ export class ChatRoom {
 
 // Default export refactored for clarity
 export default {
-  async fetch(request: Request, env: any): Promise<Response> {
+  async fetch(request: Request, env: unknown): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
