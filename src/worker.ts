@@ -59,7 +59,7 @@ export class ChatRoom {
   // Improved rate limiting
   isRateLimited(userId: string): boolean {
     const now = Date.now();
-    const bucket = this.rateBuckets.get(userId) || { count: 0, start: now };
+    const bucket = this.rateBuckets.get(userId) ?? { count: 0, start: now };
     if (now - bucket.start > RATE_LIMIT_WINDOW_MS) {
       bucket.count = 0;
       bucket.start = now;

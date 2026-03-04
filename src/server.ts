@@ -13,7 +13,7 @@ import { Signal } from "./lib/types.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT ?? 3000;
 const MAX_HISTORY_BYTES = 12 * 1024 * 1024;
 const COMMUNITY_TOKEN = process.env.COMMUNITY_TOKEN;
 const TOKEN_COOKIE_SECRET = process.env.TOKEN_COOKIE_SECRET;
@@ -63,7 +63,7 @@ const adminResetRateBuckets = new Map<string, { count: number; start: number }>(
 
 function signalRateLimitOk(userId: string): boolean {
   const now = Date.now();
-  const bucket = signalRateBuckets.get(userId) || { count: 0, start: now };
+  const bucket = signalRateBuckets.get(userId) ?? { count: 0, start: now };
   if (now - bucket.start > SIGNAL_RATE_LIMIT_WINDOW_MS) {
     bucket.count = 0;
     bucket.start = now;
@@ -75,7 +75,7 @@ function signalRateLimitOk(userId: string): boolean {
 
 function adminResetRateLimitOk(ip: string): boolean {
   const now = Date.now();
-  const bucket = adminResetRateBuckets.get(ip) || { count: 0, start: now };
+  const bucket = adminResetRateBuckets.get(ip) ?? { count: 0, start: now };
   if (now - bucket.start > ADMIN_RESET_RATE_LIMIT_WINDOW_MS) {
     bucket.count = 0;
     bucket.start = now;
@@ -154,7 +154,7 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     const params = new URLSearchParams(body);
     const token = params.get("token")?.trim();
-    const match = await nodeTimingSafeMatch(token || "", COMMUNITY_TOKEN || "");
+    const match = await nodeTimingSafeMatch(token ?? "", COMMUNITY_TOKEN || "");
     const elapsed = Date.now() - start;
     if (elapsed < 500) await new Promise(r => setTimeout(r, 500 - elapsed));
 
@@ -183,11 +183,11 @@ const server = http.createServer(async (req, res) => {
     const turnServers = parseJsonEnv(process.env.TURN_SERVERS_JSON, []);
     const signalEndpoints = parseJsonEnv(process.env.SIGNAL_ENDPOINTS_JSON, ["/signal"]);
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ turnServers, signalToken: process.env.SIGNAL_TOKEN || "", signalEndpoints }));
+    return res.end(JSON.stringify({ turnServers, signalToken: process.env.SIGNAL_TOKEN ?? "", signalEndpoints }));
   }
 
   if (method === "GET" && pathname === "/history") {
-    const limit = Math.max(1, Math.min(parseInt(parsedUrl.searchParams.get("limit") || "100", 10) || 100, 500));
+    const limit = Math.max(1, Math.min(parseInt(parsedUrl.searchParams.get("limit") ?? "100", 10) || 100, 500));
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ full: true, messages: chatService.getHistory(limit) }));
   }
@@ -223,7 +223,7 @@ const server = http.createServer(async (req, res) => {
       if (!adminResetRateLimitOk(ip)) {
         res.writeHead(429); return res.end(JSON.stringify({ error: "Rate limit" }));
       }
-      const match = await nodeTimingSafeMatch(signal.payload?.token || "", ADMIN_TOKEN || "");
+      const match = await nodeTimingSafeMatch(signal.payload?.token ?? "", ADMIN_TOKEN || "");
       if (chatService.adminReset(match)) {
         res.writeHead(200); return res.end(JSON.stringify({ success: true }));
       }
